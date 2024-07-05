@@ -1,61 +1,140 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] 
-use std::process::{Command, ExitStatus};
-use std::io::{Result, Write};
-use chrono::DateTime;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use std::io::{self, BufRead, Write};
+use std::process::{Command, Stdio};
 
-pub fn execute(exe: &str, args: &[&str]) -> Result<ExitStatus> {
-    Command::new(exe).args(args).spawn()?.wait()
-}
-
-const DEFAULT_EXE_NAME: &str = "default.exe";
-
-const GITHUB_NAME: &str = include_str!("launcher.config");
-
-#[tokio::main]
-async fn main() {
-    let version_date =
-    if let Ok(value) = std::fs::read_to_string(".version") {
-        if value.is_empty() {
-            1431648000
-        } else {
-            value.parse().unwrap_or(0)
-        }
-    } else {
-        let mut version_file = std::fs::File::create_new(".version").unwrap();
-        let date = 1431648000;
-        version_file.write_all(&date.to_string().as_bytes()).unwrap();
-        drop(version_file);
-        date
-
-    };
-
-    let (username, repo_name) = GITHUB_NAME.split_once("/").unwrap();
-
-    let version_datetime = DateTime::from_timestamp(version_date, 0).unwrap();
-    let octocrab = octocrab::instance();
-    let page = octocrab.repos(username, repo_name.trim())
-        .releases()
-        .get_latest()
-        .await
-        .unwrap();
- 
-    let url = page.assets.first().unwrap().browser_download_url.clone();
-    let exe_name = url.to_string();
-    let exe_name = exe_name.split("/").last().unwrap_or(DEFAULT_EXE_NAME);
-
-    let published_date = page.published_at.unwrap();
-    if published_date > version_datetime {
-        {
-            let mut tmpfile = std::fs::File::create(exe_name).unwrap();
-            let client = reqwest::ClientBuilder::new().user_agent("anyting/aaa").build().unwrap();
-            let res = client.get(url).send().await.unwrap().bytes().await.unwrap();
-
-            tmpfile.write_all(&res).unwrap();
-        }
-        let mut version_file = std::fs::File::options().write(true).open(".version").unwrap();
-        version_file.write_all(&published_date.timestamp().to_string().as_bytes()).unwrap();
+fn create_temp_dir(temp_dir: &Path) -> Result<(), String> {
+    // Create a temporary directory
+    if temp_dir.exists() {
+        fs::remove_dir_all(&temp_dir).map_err(|e| format!("Failed to remove existing temp dir: {}", e))?;
     }
-    let a = execute(exe_name, &Vec::new());
-    dbg!(exe_name, a);
-    //let mut zip = zip::ZipArchive::new(tmpfile).unwrap();
+    fs::create_dir(&temp_dir).map_err(|e| format!("Failed to create temp dir: {}", e))?;
+    Ok(())
 }
+
+fn write_main_rs(temp_dir: &Path, code: &str, toml: &str, github_repo: &str, build_code: &str) -> Result<PathBuf, String> {
+    fs::create_dir(temp_dir.join("src")).map_err(|e| format!("Failed to create temp dir: {}", e))?;
+
+    let main_rs_path = temp_dir.join("src/main.rs");
+    let toml_file_path = temp_dir.join("Cargo.toml");
+    let build_file_path = temp_dir.join("src/build.rs");
+    let config_file_path = temp_dir.join("launcher.config");
+
+    let mut main_rs_file = File::create(&main_rs_path)
+        .map_err(|e| format!("Failed to create main.rs: {}", e))?;
+    main_rs_file.write_all(code.as_bytes())
+
+        .map_err(|e| format!("Failed to write to main.rs: {}", e))?;
+    let mut config_file = File::create(&config_file_path)
+        .map_err(|e| format!("Failed to create Cargo.toml: {}", e))?;
+    config_file.write_all(github_repo.as_bytes());
+
+    let mut toml_file = File::create(&toml_file_path)
+        .map_err(|e| format!("Failed to create Cargo.toml: {}", e))?;
+    toml_file.write_all(toml.as_bytes());
+
+    let mut build_file = File::create(&build_file_path)
+        .map_err(|e| format!("Failed to create Cargo.toml: {}", e))?;
+    build_file.write_all(build_code.as_bytes());
+
+
+
+    Ok(temp_dir.to_path_buf())
+}
+
+fn compile_rust_file(file_path: &Path) -> Result<(), String> {
+   let output = Command::new("cargo")
+        .arg("build")
+        .arg("--release")
+        .arg("--manifest-path")
+        .arg(file_path.join("Cargo.toml"))
+        //.current_dir(file_path)
+        .output()
+        .map_err(|e| format!("Failed to execute cargo: {}", e))?;
+
+    if output.status.success() {
+        println!("Build succeeded.");
+
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("Build failed:\n{}", stderr))
+    }
+}
+
+fn compile_rust_project(project_path: &Path) -> Result<(), String> {
+    let mut child = Command::new("cargo")
+        .arg("build")
+        .arg("--release")
+        .arg("--manifest-path")
+        .arg(project_path.join("Cargo.toml"))     
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to execute cargo: {}", e))?;
+
+    let stdout = child.stdout.take().ok_or_else(|| "Failed to capture stdout".to_string())?;
+    let stderr = child.stderr.take().ok_or_else(|| "Failed to capture stderr".to_string())?;
+
+    let stdout_reader = io::BufReader::new(stdout);
+    let stderr_reader = io::BufReader::new(stderr);
+
+    let stdout_thread = std::thread::spawn(move || {
+        for line in stdout_reader.lines() {
+            if let Ok(line) = line {
+                println!("{}", line);
+            }
+        }
+    });
+
+    let stderr_thread = std::thread::spawn(move || {
+        for line in stderr_reader.lines() {
+            if let Ok(line) = line {
+                eprintln!("{}", line);
+            }
+        }
+    });
+
+    let status = child.wait().map_err(|e| format!("Failed to wait on child process: {}", e))?;
+
+    stdout_thread.join().unwrap();
+    stderr_thread.join().unwrap();
+
+    if status.success() {
+        println!("Build succeeded.");
+        fs::rename(project_path.join("target/release/launcher.exe"), "./launcher.exe");
+        Ok(())
+    } else {
+        Err("Build failed".to_string())
+    }
+}
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let github_repo = args.get(1).expect("GitHub repo missing");
+    println!("Creating launcher from {} repo", github_repo);
+    // Include the Rust code as a string
+    let rust_code = include_str!("./launcher.rs");
+    let toml_code = include_str!("./Cargo.toml");
+    let build_code = include_str!("./build.rs");
+    let temp_dir = PathBuf::from("./temp");
+    match create_temp_dir(&temp_dir) {
+        Ok(_) => {
+            match write_main_rs(&temp_dir, rust_code, toml_code, github_repo, build_code) {
+                Ok(main_rs_path) => {
+                    match compile_rust_project(&main_rs_path) {
+                        Ok(_) => println!("Project compiled successfully."),
+                        Err(e) => eprintln!("Error: {}", e),
+                    }
+                },
+                Err(e) => eprintln!("Error writing main.rs: {}", e),
+            }
+
+            // Clean up the temporary directory
+            if let Err(e) = fs::remove_dir_all(&temp_dir) {
+                eprintln!("Failed to remove temporary directory: {}", e);
+            }
+        }
+        Err(e) => eprintln!("Error creating temporary project: {}", e),
+    }
+}
+
